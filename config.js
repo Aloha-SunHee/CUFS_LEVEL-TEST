@@ -1,7 +1,7 @@
 // ── CUFS 중국어학부 레벨테스트 설정 ───────────────────────────
 window.APP_CONFIG = {
   // 새 구글시트 → Apps Script 배포 후 웹 앱 URL을 아래에 넣으세요.
-  SCRIPT_URL: '',
+  SCRIPT_URL: 'https://script.google.com/macros/s/AKfycbwX6TqVqRRfGGkVv7jqEsYXKB9RYho4unteU9Xe52mzu2yYxJ-T7EvkxT4gh5N_dqkJ/exec',
   CLASS_NAME: '사이버한국외국어대학교 중국어학부 · 중국어 레벨테스트',
   ID_LABEL: '학번',
   // 응시 회차(학기) 선택 옵션
