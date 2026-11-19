@@ -336,14 +336,74 @@ function viewHome(){
     </div>
     ${nowBanner()}
     ${regHist.length ? growthCardHTML(regHist) : ''}
-    <h2 style="margin:20px 0 4px">레벨테스트 세트 선택 (총 ${SETS.length}회)</h2>
-    <p class="muted" style="margin-top:0">입문(발음·성조·기초 한자)부터 초급(HSK 1~2급)·중급(3~4급)·고급(5~6급)까지 100문항으로 수준을 진단합니다. 중간에 나가도 자동 저장되며, <b>학기말에 같은 세트를 다시 풀면 지난번 틀린 문제와 자동 비교</b>됩니다.</p>
-    <div class="sets">${SETS.map(set => setCard(set, hist)).join('')}</div>
+    ${regHist.length ? homeTabsHTML(regHist, hist) : `
+      <h2 style="margin:20px 0 4px">중국어 레벨테스트</h2>
+      <p class="muted" style="margin-top:0">입문(발음·성조·기초 한자)부터 초급(HSK 1~2급)·중급(3~4급)·고급(5~6급)까지 100문항으로 수준을 진단합니다. 중간에 나가도 자동 저장되니 나중에 이어서 풀 수 있습니다.</p>
+      <div class="sets">${setCard(nextSet(), hist)}</div>`}
+    ${TEACHER ? `<details style="margin-top:24px"><summary>교수자: 전체 세트 미리보기 (총 ${SETS.length}회)</summary><div class="sets">${SETS.map(set => setCard(set, hist)).join('')}</div></details>` : ''}
     <p class="muted" style="margin-top:24px;font-size:13px">🎧 듣기 문항이 포함되어 있으니 이어폰을 준비하세요. ${CFG.SCRIPT_URL?'':'<br>⚠️ 현재 구글시트 미연결 상태이므로 기록은 이 브라우저에만 저장됩니다.'}</p>
   </div>`;
   document.getElementById('homeTerm').onchange = ev => { S.term = ev.target.value; LS.set('cufs_lt_term', S.term); };
 }
 
+// 학생이 다음에 볼 세트: 풀던 세트 → 아직 안 본 세트(1회부터 차례로) → 모두 봤으면 처음부터 다시
+function examHist(){ return LS.get(histKey(S.user.sid), []).filter(h => h.mode !== 'retry'); }
+function nextSet(){
+  const inprog = SETS.find(s => LS.get(progKey(S.user.sid, s.id), null));
+  if(inprog) return inprog;
+  const done = new Set(examHist().map(h => h.set));
+  return SETS.find(s => !done.has(s.id)) || SETS[examHist().length % SETS.length];
+}
+function homeTabsHTML(regHist, hist){
+  const tab = S.homeTab || (SETS.some(s => LS.get(progKey(S.user.sid, s.id), null)) ? 'new' : 'past');
+  const tabs = `<div class="tabs" role="tablist" style="margin-top:18px">
+    <button role="tab" data-act="hometab" data-v="past" aria-selected="${tab==='past'}">📄 지난 시험 다시보기</button>
+    <button role="tab" data-act="hometab" data-v="new" aria-selected="${tab==='new'}">✏️ 새로운 시험 도전</button></div>`;
+  if(tab === 'new'){
+    const ns = nextSet(), inprog = LS.get(progKey(S.user.sid, ns.id), null);
+    return tabs + `<p class="muted" style="margin:10px 0 0">${inprog ? '풀던 시험이 있습니다. 이어서 풀 수 있습니다.' : '이번 학기 레벨테스트에 다시 도전합니다. <b>지난번과 다른 문제</b>로 출제되며, 결과는 지난 시험과 비교해 보여 줍니다. 시작 전에 위쪽의 <b>현재 응시 구분</b>(예: 1학기말)을 확인하세요.'}</p>
+      <div class="sets">${setCard(ns, hist)}</div>`;
+  }
+  const list = regHist.map((h, i) => ({h, i})).reverse();
+  return tabs + `<div class="sets">${list.map(({h, i}) => {
+    const p = Math.round(h.c / Math.max(1, h.t) * 100), w = LS.get(wrongKey(S.user.sid, h.set), []).length;
+    return `<div class="card set">
+      <h2><span class="chip">${esc(h.term || '응시')}</span> ${esc(getSet(h.set)?.title || h.set)}</h2>
+      <div class="meta">${new Date(h.at).toLocaleDateString('ko-KR')} · <span class="mono">${h.c}/${h.t} (${p}%)</span></div>
+      ${h.grade ? `<div style="font-size:14px;margin-bottom:8px">🎯 ${esc(h.grade)}</div>` : ''}
+      <button class="btn pri" data-act="review" data-v="${i}">결과·해설 다시보기</button>
+      ${w ? `<button class="btn sm seal" data-act="start" data-set="${h.set}" data-scope="retry">오답만 다시 풀기 (${w})</button>` : ''}
+    </div>`;}).join('')}</div>`;
+}
+// 지난 시험을 제출 직후 화면 그대로 다시 보여 줌 (정답·해설·진단·추천 과목)
+async function reviewPast(i){
+  const h = examHist()[i]; if(!h) return;
+  const set = getSet(h.set); if(!set){ toast('이 시험 세트를 찾을 수 없습니다.'); return; }
+  let ans = h.ans;
+  if(!ans){
+    // 다른 기기에서 본 시험: 맞힌 문항은 정답으로, 틀린 문항은 오답노트의 내 답으로 채움
+    if(CFG.SCRIPT_URL){ try{ const r = await api({action:'notebook', sid:S.user.sid}); if(r && r.ok && r.items){ const nb = LS.get(nbKey(S.user.sid), {}); for(const x of r.items){ const k = x.set+'|'+x.id; if(!nb[k] || x.tries >= nb[k].tries) nb[k] = x; } LS.set(nbKey(S.user.sid), nb); } }catch(e){} }
+    const nb = LS.get(nbKey(S.user.sid), {}), wrong = new Set(h.wrong || []);
+    ans = {};
+    for(const e of flatten(set)) if(e.obj){
+      const it = e.item;
+      if(!wrong.has(it.id)) ans[it.id] = Array.isArray(it.ans) ? it.ans[0] : it.ans;
+      else { const x = nb[set.id+'|'+it.id]; const hx = x && (x.history||[]).find(y => y.term === h.term && !y.ok); ans[it.id] = hx ? hx.resp : (x ? x.firstResp : ''); }
+    }
+  }
+  const entries = flatten(set), per = {}, tierPer = {}; let c = 0;
+  for(const e of entries.filter(e => e.obj)){
+    const ok = isCorrect(e, ans[e.item.id]); if(ok) c++;
+    const k = e.sec.key; per[k] = per[k] || {c:0,t:0}; per[k].t++; if(ok) per[k].c++;
+    const tr = e.item.tier || 'elem'; tierPer[tr] = tierPer[tr] || {c:0,t:0}; tierPer[tr].t++; if(ok) tierPer[tr].c++;
+  }
+  const t = entries.filter(e => e.obj).length, pct = Math.round(c / Math.max(1, t) * 100);
+  S = {...S, view:'test', mode:'exam', set, scope:'exam', entries, ids:new Set(entries.map(e => e.item.id)), ans,
+       submitted:true, t0:Date.now(), tab:entries[0].sec.key, retryCount: LS.get(wrongKey(S.user.sid, set.id), []).length,
+       result:{c, t, pct, per, tierPer, dur:h.dur || 0, diag: diagnose(pct, tierPer), past:true, term:h.term, at:h.at,
+               cmp:{}, repeatWrongIds:new Set(), fixedIds:[], newWrongIds:[]}};
+  render();
+}
 function growthCardHTML(regHist){
   const first = regHist[0], last = regHist[regHist.length - 1];
   const fPct = Math.round(first.c / Math.max(1, first.t) * 100);
@@ -383,9 +443,7 @@ function setCard(set, hist){
       <button class="btn pri" data-act="exam" data-set="${set.id}" data-v="resume">이어서 풀기</button>
       <button class="btn sm ghost" data-act="exam" data-set="${set.id}" data-v="new">새로 응시</button>`
       : `<button class="btn pri" data-act="exam" data-set="${set.id}" data-v="new">${done.length?'학기말 재응시 시작':'레벨테스트 시작'}</button>`}
-    <div class="row">
-      <button class="btn sm ${wrong.length?'seal':''}" data-act="start" data-set="${set.id}" data-scope="retry" ${wrong.length?'':'disabled'}>오답만 다시 풀기 (${wrong.length})</button>
-    </div>
+    ${wrong.length ? `<div class="row"><button class="btn sm seal" data-act="start" data-set="${set.id}" data-scope="retry">오답만 다시 풀기 (${wrong.length})</button></div>` : ''}
     ${done.length?`<div class="last muted">직전 [${esc(done.slice(-1)[0].term||'응시')}]: <b>${done.slice(-1)[0].c}/${done.slice(-1)[0].t}</b> (${Math.round(done.slice(-1)[0].c/Math.max(1,done.slice(-1)[0].t)*100)}%) · ${new Date(done.slice(-1)[0].at).toLocaleDateString('ko-KR')}</div>`:''}
   </div>`;
 }
@@ -413,7 +471,7 @@ function inScope(item){ return S.ids.has(item.id); }
 
 function viewTest(){
   const secs = S.set.sections.filter(sec => S.entries.some(e => e.sec === sec));
-  const modeLabel = S.mode==='exam' ? `${S.term} · 진단테스트` : '오답 다시 풀기';
+  const modeLabel = S.result?.past ? `지난 시험 다시보기 · ${S.result.term||''}` : S.mode==='exam' ? `${S.term} · 진단테스트` : '오답 다시 풀기';
   app.innerHTML = topbar(`<span class="chip">${esc(modeLabel)}</span>${TEACHER?'<span class="chip warn">교수자 모드</span>':''}<span class="mono muted" id="clock">00:00</span>${S.mode==='exam'&&!S.submitted?'<span class="muted" id="saved" style="font-size:12px"></span><button class="btn sm" data-act="saveexit">저장하고 나가기</button>':'<button class="btn sm" data-act="home">나가기</button>'}`) + `
   <div class="wrap">
     <h1>${esc(S.set.title)}</h1>
@@ -604,6 +662,7 @@ async function submit(){
   // 이전 동일 세트 응시 기록과 비교 (반복 오답 / 극복 오답 판별)
   const hist = LS.get(histKey(S.user.sid), []);
   const prevSame = [...hist].reverse().find(h => h.set === S.set.id && h.mode !== 'retry');
+  const prevAny = S.mode === 'exam' ? [...hist].reverse().find(h => h.mode !== 'retry') : null;
   const cmp = {}, repeatWrongIds = new Set(), fixedIds = [], newWrongIds = [];
   if(prevSame && Array.isArray(prevSame.wrong)){
     const prevW = new Set(prevSame.wrong);
@@ -614,8 +673,8 @@ async function submit(){
     }
   }
 
-  S.submitted = true;
-  S.result = {c, t:obj.length, pct, per, tierPer, dur, diag, prevSame, cmp, repeatWrongIds, fixedIds, newWrongIds};
+  S.submitted = true; S.homeTab = null;
+  S.result = {c, t:obj.length, pct, per, tierPer, dur, diag, prevSame, prevAny, cmp, repeatWrongIds, fixedIds, newWrongIds};
   S.tab = S.entries[0]?.sec.key;
 
   const wk = wrongKey(S.user.sid, S.set.id); const wrong = new Set(LS.get(wk, []));
@@ -627,7 +686,8 @@ async function submit(){
   hist.push({
     set:S.set.id, term:S.term, mode:S.mode==='exam'?'exam':'retry', c, t:obj.length,
     L: per.L?`${per.L.c}/${per.L.t}`:'', R: per.R?`${per.R.c}/${per.R.t}`:'',
-    grade: diag ? diag.grade : '', wrong: wrongArr, at:Date.now()
+    grade: diag ? diag.grade : '', wrong: wrongArr, at:Date.now(), dur:Math.round(dur),
+    ans: S.mode === 'exam' ? Object.fromEntries(Object.entries(S.ans).filter(([k]) => !k.startsWith('_'))) : undefined
   });
   LS.set(histKey(S.user.sid), hist.slice(-200));
 
@@ -669,7 +729,17 @@ function resultHTML(){
   }).join('');
 
   let cmpBox = '';
-  if(r.prevSame){
+  if(r.past){
+    cmpBox = `<div class="muted" style="margin-top:8px;font-size:13px">📄 ${new Date(r.at).toLocaleDateString('ko-KR')}에 본 시험의 결과입니다.</div>`;
+  } else if(!r.prevSame && r.prevAny){
+    const prevPct = Math.round(r.prevAny.c / Math.max(1, r.prevAny.t) * 100), diff = r.pct - prevPct;
+    cmpBox = `<div class="card" style="margin-top:12px;background:var(--paper)">
+      <b>🔄 지난 시험([${esc(r.prevAny.term||'이전')}] ${esc(getSet(r.prevAny.set)?.title||'')} · ${prevPct}%)과 비교</b>
+      <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
+        <span class="chip ${diff>=0?'':'seal'}">점수 변화: ${diff>=0?'+':''}${diff}%p</span>
+        ${r.prevAny.grade ? `<span class="chip warn">지난 진단: ${esc(r.prevAny.grade)}</span>` : ''}
+      </div></div>`;
+  } else if(r.prevSame){
     const prevPct = Math.round(r.prevSame.c / Math.max(1, r.prevSame.t) * 100);
     const diff = r.pct - prevPct;
     cmpBox = `<div class="card" style="margin-top:12px;background:var(--paper)">
@@ -688,7 +758,7 @@ function resultHTML(){
     <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
       <div class="score-big">${r.pct}<span style="font-size:20px">%</span></div>
       <div>
-        <b>${r.c} / ${r.t} 정답</b> · 소요 ${fmtTime(r.dur)} · <span class="chip">${esc(S.term)}</span><br>
+        <b>${r.c} / ${r.t} 정답</b> · 소요 ${fmtTime(r.dur)} · <span class="chip">${esc(r.term || S.term)}</span><br>
         <span class="muted" style="font-size:13px">아래에서 문항별 정답·해설 및 AI 심층 해설을 확인하세요.</span>
       </div>
     </div>
@@ -866,6 +936,8 @@ document.addEventListener('click', async ev => {
   if(act === 'font'){ const order=['m','l','xl']; const cur=document.body.dataset.size||'m'; document.body.dataset.size = order[(order.indexOf(cur)+1)%3]; LS.set('cufs_font', document.body.dataset.size); }
   else if(act === 'logout'){ if(S.view==='test') persist(true); S.user = null; LS.set('cufs_lt_user', null); S.view='login'; render(); }
   else if(act === 'start'){ startTest(b.dataset.set, b.dataset.scope); }
+  else if(act === 'hometab'){ S.homeTab = v; render(); }
+  else if(act === 'review'){ reviewPast(+v); }
   else if(act === 'exam'){ startTest(b.dataset.set, 'exam', v === 'resume'); }
   else if(act === 'home'){ if(S.view==='test' && !S.submitted && S.mode!=='exam' && !confirm('나가시겠습니까?')) return; S.view='home'; render(); syncWrong(); }
   else if(act === 'saveexit'){ persist(true); toast('저장되었습니다. 다음에 ‘이어서 풀기’로 계속하세요.'); S.view='home'; render(); }
