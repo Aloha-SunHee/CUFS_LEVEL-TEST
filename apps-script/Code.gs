@@ -11,13 +11,18 @@
  *  4. 배포 → 새 배포 → 유형: 웹 앱 / 실행: 나 / 액세스: 모든 사용자 → 배포
  *  5. 웹 앱 URL 을 config.js 의 SCRIPT_URL 에 붙여 넣기
  */
-const SCOPE_KO = { exam: '전체 진단', all: '전체', L: '듣기', R: '독해', retry: '오답 복습' };
+const SCOPE_KO = { exam: '전체 진단', all: '전체', L: '듣기', R: '독해', retry: '오답 복습', recheck: '재확인' };
+const TIERS = ['basic', 'elem', 'mid', 'adv'];
+function ct_(s) { const m = String(s || '').replace(/^'/, '').match(/^(\d+)\/(\d+)$/); return m ? { c: +m[1], t: +m[2] } : null; }
+function pct_(v) { return v && v.t ? Math.round(v.c / v.t * 100) : null; }
+function tierAvg_(tiers) { const v = TIERS.map(k => pct_(tiers[k])).filter(x => x != null); return v.length ? Math.round(v.reduce((a, b) => a + b, 0) / v.length) : null; }
 const SH = { sub: '제출기록', ans: '문항기록', fb: 'AI해설기록', stu: '학생', prog: '진행상황' };
 const HEAD = {
   stu: ['학번', '이름', '가입일', '최근접속'],
   prog: ['학번', '세트', '진행률', '저장시간', '데이터(JSON)'],
-  sub: ['시간', '학번', '이름', '세트', '응시구분', '모드', '점수', '만점', '정답률', '듣기', '독해', '진단등급', '소요(분)', '오답문항'],
-  ans: ['시간', '학번', '이름', '세트', '응시구분', '모드', '문항', '영역', '유형', '학생답', '정답', '정오'],
+  sub: ['시간', '학번', '이름', '세트', '응시구분', '모드', '점수', '만점', '정답률', '듣기', '독해', '진단등급', '소요(분)', '오답문항',
+        '입문', '초급', '중급', '고급', '공통문항', '재확인(또틀림/문항)'],
+  ans: ['시간', '학번', '이름', '세트', '응시구분', '모드', '문항', '영역', '유형', '학생답', '정답', '정오'],  // 모드: exam / retry / recheck(학기말 재확인 문항, 세트·문항은 원래 것)
   fb:  ['시간', '학번', '이름', '세트', '문항', '질문', 'AI해설']
 };
 
@@ -99,7 +104,7 @@ function summary_(set) {
   const seen = {};
   for (let i = 1; i < av.length; i++) {
     const r = av[i];
-    if (r[3] !== set || r[5] === 'retry' || (r[11] !== 'O' && r[11] !== 'X')) continue;
+    if (r[3] !== set || r[5] === 'retry' || r[5] === 'recheck' || (r[11] !== 'O' && r[11] !== 'X')) continue;
     seen[r[1] + '|' + r[6]] = { id: r[6], ok: r[11] === 'O' };
   }
   const items = {};
@@ -120,18 +125,22 @@ function growthReport_() {
     const sid = String(r[1]);
     const st = byStu[sid] = byStu[sid] || { sid: sid, name: r[2], records: [] };
     st.name = r[2];
+    const tiers = {}; TIERS.forEach((k, j) => { const v = ct_(r[14 + j]); if (v) tiers[k] = v; });
+    const rc = ct_(r[19]);
     st.records.push({
       time: String(r[0]).slice(0, 16), set: r[3], term: r[4],
       score: Number(r[6]) || 0, total: Number(r[7]) || 100,
       pct: Math.round((Number(r[6]) || 0) / Math.max(1, Number(r[7]) || 100) * 100),
-      L: r[9], R: r[10], grade: r[11], wrongList: String(r[13] || '').split(' ').filter(Boolean)
+      L: r[9], R: r[10], grade: r[11], wrongList: String(r[13] || '').split(' ').filter(Boolean),
+      tiers: tiers, avg: tierAvg_(tiers), anchor: ct_(r[18]), recheck: rc ? { repeat: rc.c, t: rc.t } : null
     });
   }
   const list = Object.keys(byStu).map(sid => {
     const st = byStu[sid], recs = st.records;
     const first = recs[0], last = recs[recs.length - 1];
     let repeatWrong = 0;
-    if (recs.length >= 2 && first.set === last.set) {
+    if (recs.length >= 2 && last.recheck) repeatWrong = last.recheck.repeat;   // 학기말 재확인 문항 중 또 틀린 수
+    else if (recs.length >= 2 && first.set === last.set) {
       const prevSet = {}; first.wrongList.forEach(id => prevSet[id] = true);
       repeatWrong = last.wrongList.filter(id => prevSet[id]).length;
     }
@@ -139,6 +148,10 @@ function growthReport_() {
       sid: st.sid, name: st.name, count: recs.length,
       first: first, last: last,
       diff: recs.length >= 2 ? (last.pct - first.pct) : null,
+      // 총점 대신 난이도별 정답률로 비교 (회차마다 문항이 다르므로)
+      avgDiff: recs.length >= 2 && first.avg != null && last.avg != null ? last.avg - first.avg : null,
+      tierDiff: recs.length >= 2 ? TIERS.reduce((o, k) => { const a = pct_(first.tiers[k]), b = pct_(last.tiers[k]); if (a != null && b != null) o[k] = b - a; return o; }, {}) : null,
+      anchorDiff: recs.length >= 2 && first.anchor && last.anchor ? last.anchor.c - first.anchor.c : null,
       repeatWrong: repeatWrong, records: recs
     };
   }).sort((a, b) => a.sid < b.sid ? -1 : 1);
@@ -151,7 +164,7 @@ function review_(sets) {
   const seen = {};
   for (let i = 1; i < av.length; i++) {
     const r = av[i];
-    if (!want[r[3]] || r[5] === 'retry' || (r[11] !== 'O' && r[11] !== 'X')) continue;
+    if (!want[r[3]] || r[5] === 'retry' || r[5] === 'recheck' || (r[11] !== 'O' && r[11] !== 'X')) continue;
     seen[r[3] + '|' + r[6] + '|' + r[1]] = { set: r[3], id: r[6], name: String(r[2] || r[1]), resp: String(r[9]), ok: r[11] === 'O' };
   }
   const items = {}, students = {};
@@ -239,14 +252,20 @@ function submit_(p) {
   try {
     const t = now_(), per = p.per || {};
     const f = k => per[k] ? per[k].c + '/' + per[k].t : '';
-    const wrong = (p.answers || []).filter(a => a.ok === false).map(a => a.id).join(' ');
+    // 오답문항 열에는 본 문항(이번 세트)의 오답만. 재확인·공통 문항은 문항기록 시트에 원래 세트로 남습니다.
+    const wrong = (p.answers || []).filter(a => a.ok === false && (a.set || p.setId) === p.setId && (a.mode || p.mode) === p.mode).map(a => a.id).join(' ');
+    // '5/22' 같은 값이 날짜로 바뀌지 않도록 앞에 ' 를 붙여 글자로 저장합니다.
+    const txt = (c, t) => "'" + c + '/' + t;
+    const tiers = p.tiers || {}, tf = k => tiers[k] ? txt(tiers[k].c, tiers[k].t) : '';
     sheet_('sub').appendRow([
       t, p.sid, p.name, p.setId, p.term || '입학 진단', p.mode,
       p.score, p.total, p.total ? Math.round(p.score / p.total * 100) / 100 : 0,
-      f('L'), f('R'), p.grade || '', Math.round((p.durationSec || 0) / 6) / 10, wrong
+      f('L'), f('R'), p.grade || '', Math.round((p.durationSec || 0) / 6) / 10, wrong,
+      tf('basic'), tf('elem'), tf('mid'), tf('adv'),
+      p.anchor ? txt(p.anchor.c, p.anchor.t) : '', p.recheck ? txt(p.recheck.repeat, p.recheck.t) : ''
     ]);
     const rows = (p.answers || []).map(a => [
-      t, p.sid, p.name, p.setId, p.term || '입학 진단', p.mode,
+      t, p.sid, p.name, a.set || p.setId, p.term || '입학 진단', a.mode || p.mode,
       a.id, a.sec, a.part, String(a.resp).slice(0, 500), a.key, a.ok === true ? 'O' : a.ok === false ? 'X' : ''
     ]);
     if (rows.length) {
@@ -282,7 +301,9 @@ function loadProgress_(p) {
       history.push({
         set: sv[i][3], term: sv[i][4], mode: sv[i][5],
         c: sv[i][6], t: sv[i][7], L: sv[i][9], R: sv[i][10], grade: sv[i][11],
-        wrong: String(sv[i][13] || '').split(' ').filter(Boolean), at: String(sv[i][0])
+        wrong: String(sv[i][13] || '').split(' ').filter(Boolean), at: String(sv[i][0]),
+        tiers: { basic: String(sv[i][14] || ''), elem: String(sv[i][15] || ''), mid: String(sv[i][16] || ''), adv: String(sv[i][17] || '') },
+        anchor: String(sv[i][18] || ''), recheck: String(sv[i][19] || '')
       });
     }
   }
