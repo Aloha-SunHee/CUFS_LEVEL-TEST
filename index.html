@@ -139,6 +139,7 @@ table.dash th{font-size:12px;color:var(--muted)}
 <script src="data/lt6.js"></script>
 <script src="data/lt7.js"></script>
 <script src="data/lt8.js"></script>
+<script src="data/anchor.js"></script>
 <script>
 'use strict';
 const CFG = window.APP_CONFIG || {};
@@ -150,8 +151,22 @@ const TEACHER = qs.has('teacher');
 const tOK = () => TEACHER && sessionStorage.getItem('cufs_pin_ok') === '1';
 const OBJ = new Set(['tf','lmc','lgroup','bank','order','rmc','rgroup','cloze','error','multi','sentfill','arrange']);
 const LETTERS = ['A','B','C','D','E','F'];
-const SEC_KO = {L:'듣기',R:'읽기',W:'쓰기',S:'말하기'};
+const SEC_KO = {L:'듣기',R:'읽기',W:'쓰기',S:'말하기',A:'공통 문항',C:'재확인 문항'};
 const TIER_KO = {basic:'입문·발음/한자', elem:'초급 (1~2급)', mid:'중급 (3~4급)', adv:'고급 (5~6급)'};
+const TIER_SHORT = {basic:'입문', elem:'초급', mid:'중급', adv:'고급'};
+const TIER_ORDER = ['basic','elem','mid','adv'];
+// 공통 문항: 모든 회차에 똑같이 나오는 12문항 (data/anchor.js). 수준 진단 점수에는 넣지 않고 따로 비교합니다.
+const ANCHOR = window.ANCHOR_SET || null;
+// 재확인 문항: 학기말 등 두 번째 이후 시험에, 지난 시험에서 틀린 문항을 이 개수만큼 다시 넣습니다 (0이면 끔).
+const RECHECK_N = Number.isFinite(CFG.RECHECK_COUNT) ? CFG.RECHECK_COUNT : 10;
+const pctOf = v => v && v.t ? Math.round(v.c / v.t * 100) : null;
+// 난이도별 정답률의 평균 (입문·초급·중급·고급을 같은 비중으로). 회차마다 문항 수가 같아도 난이도 구성이 흔들릴 수 있어 총점 대신 씁니다.
+function tierAvg(tiers){
+  if(!tiers) return null;
+  const v = TIER_ORDER.map(k => pctOf(tiers[k])).filter(x => x != null);
+  return v.length ? Math.round(v.reduce((a,b)=>a+b,0) / v.length) : null;
+}
+const signed = n => (n > 0 ? '+' : '') + n;
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const LS = {
   get(k, d){ try{ const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; }catch(e){ return d; } },
@@ -162,15 +177,72 @@ const fmtTime = s => `${String(Math.floor(s/60)).padStart(2,'0')}:${String(Math.
 function toast(msg, ms=2600){ const t=document.createElement('div'); t.className='toast'; t.textContent=msg; document.body.appendChild(t); setTimeout(()=>t.remove(), ms); }
 
 // ── data helpers ──
-function getSet(id){ return SETS.find(s => s.id === id); }
-function flatten(set){
+function getSet(id){ return SETS.find(s => s.id === id) || (ANCHOR && id === ANCHOR.id ? ANCHOR : null); }
+function flattenSecs(secs){
   const out = [];
-  for(const sec of set.sections) for(const part of sec.parts){
-    if(part.groups) for(const g of part.groups) for(const item of g.items) out.push({sec, part, group:g, item, obj:OBJ.has(part.type)});
-    else for(const item of part.items) out.push({sec, part, group:null, item, obj:OBJ.has(part.type)});
+  for(const sec of secs) for(const part of sec.parts){
+    const extra = sec.key === 'A' ? 'anchor' : sec.key === 'C' ? 'recheck' : null;
+    if(part.groups) for(const g of part.groups) for(const item of g.items) out.push({sec, part, group:g, item, obj:OBJ.has(part.type), extra});
+    else for(const item of part.items) out.push({sec, part, group:null, item, obj:OBJ.has(part.type), extra});
   }
   return out;
 }
+function flatten(set){ return flattenSecs(set.sections); }
+// 응답 기록용: 재확인 문항은 원래 세트·문항 번호로, 공통 문항은 'anchor' 세트로 저장
+function originOf(e){
+  if(e.extra === 'recheck') return {set:e.item._set, id:e.item._oid};
+  if(e.extra === 'anchor') return {set:ANCHOR.id, id:e.item.id};
+  return {set:S.set.id, id:e.item.id};
+}
+
+// ── 재확인 문항 ──
+// 가장 최근의 다른 회차 시험에서 틀린 문항 중 RECHECK_N개를 난이도별로 고르게 골라, 이번 시험에 다시 넣습니다.
+// 아직 해결 못 한(오답 다시 풀기에서도 못 맞힌) 문항을 먼저 고릅니다.
+function pickRecheck(curSetId){
+  if(!RECHECK_N) return [];
+  const prev = [...examHist()].reverse().find(h => h.set !== curSetId && (h.wrong||[]).length);
+  const set = prev && getSet(prev.set); if(!set) return [];
+  const prevWrong = new Set(prev.wrong), still = new Set(LS.get(wrongKey(S.user.sid, prev.set), []));
+  const flat = flatten(set), idx = new Map(flat.map((e,i) => [e.item.id, i]));
+  const cand = flat.filter(e => e.obj && prevWrong.has(e.item.id)).sort((a,b) => (still.has(b.item.id) - still.has(a.item.id)));
+  const byTier = {}; for(const e of cand) (byTier[e.item.tier||'elem'] = byTier[e.item.tier||'elem'] || []).push(e);
+  const out = []; let k = 0;
+  while(out.length < RECHECK_N && TIER_ORDER.some(t => byTier[t]?.length)){ const t = TIER_ORDER[k++ % 4]; if(byTier[t]?.length) out.push(byTier[t].shift()); }
+  return out.sort((a,b) => idx.get(a.item.id) - idx.get(b.item.id)).map(e => ({set:prev.set, id:e.item.id}));
+}
+function cloneItem(it, sid, label){ return {...it, id:`C_${sid}_${it.id}`, _set:sid, _oid:it.id, _label:label}; }
+function recheckSection(rc){
+  if(!rc || !rc.length) return null;
+  const bySet = {}; rc.forEach(x => (bySet[x.set] = bySet[x.set] || new Set()).add(x.id));
+  const parts = [];
+  for(const sid of Object.keys(bySet)){
+    const set = getSet(sid); if(!set) continue;
+    const want = bySet[sid];
+    for(const sec of set.sections) for(const part of sec.parts){
+      const lab = it => `${set.label||set.title} ${SEC_KO[sec.key]} ${itemNo(it.id)}`;
+      const title = `${set.label||set.title} ${SEC_KO[sec.key]} · ${part.title}`;
+      if(part.groups){
+        const groups = part.groups.map(g => ({...g, id:`C_${sid}_${g.id}`, _set:sid, _oid:g.id, items:g.items.filter(it => want.has(it.id)).map(it => cloneItem(it, sid, lab(it)))})).filter(g => g.items.length);
+        if(groups.length) parts.push({...part, title, groups});
+      } else {
+        const items = part.items.filter(it => want.has(it.id)).map(it => cloneItem(it, sid, lab(it)));
+        if(items.length) parts.push({...part, title, items});
+      }
+    }
+  }
+  return parts.length ? {key:'C', name:'复习', ko:'재확인 문항', parts,
+    intro:`🔁 <b>재확인 문항 ${rc.length}개</b> — 지난 시험에서 틀렸던 문제입니다. 이번에는 맞힐 수 있는지 확인합니다. 수준 진단 점수(100문항)에는 들어가지 않습니다.`} : null;
+}
+// 시험(진단) 한 번에 나오는 영역: 본 문항(듣기·읽기) + 공통 문항 + 재확인 문항
+function examSections(set, rc, withAnchor = true){
+  const secs = [...set.sections];
+  if(ANCHOR && withAnchor) secs.push(...ANCHOR.sections.map(s => ({...s,
+    intro:`📌 <b>공통 문항 ${ANCHOR_N}개</b> — 모든 회차에 똑같이 나오는 문제입니다. 입학 진단과 학기말 결과를 같은 문제로 비교하는 데 씁니다. 수준 진단 점수(100문항)에는 들어가지 않습니다.`})));
+  const r = recheckSection(rc); if(r) secs.push(r);
+  return secs;
+}
+const ANCHOR_N = ANCHOR ? flattenSecs(ANCHOR.sections).filter(e => e.obj).length : 0;
+const anchorMinutes = () => ANCHOR ? Object.values(ANCHOR.minutes||{}).reduce((a,b)=>a+b,0) : 0;
 function isCorrect(e, resp){
   if(resp == null || resp === '') return false;
   if(e.part.type === 'arrange') return e.item.ans.some(a => norm(a) === norm(resp));
@@ -216,7 +288,12 @@ async function syncProgress(){
       for(const h of r.history){
         const at = new Date(String(h.at).replace(' ', 'T') + '+09:00').getTime();
         if(!hist.some(x => x.set === h.set && x.c === h.c && Math.abs(x.at - at) < 120000)){
-          hist.push({set:h.set, term:h.term||'입학 진단', mode:h.mode, c:+h.c, t:+h.t, L:h.L, R:h.R, grade:h.grade, wrong:h.wrong||[], at});
+          const ct = s => { const m = String(s||'').match(/^(\d+)\/(\d+)$/); return m ? {c:+m[1], t:+m[2]} : null; };
+          const tiers = {}; for(const k of TIER_ORDER){ const v = ct(h.tiers && h.tiers[k]); if(v) tiers[k] = v; }
+          const rc = ct(h.recheck);
+          hist.push({set:h.set, term:h.term||'입학 진단', mode:h.mode, c:+h.c, t:+h.t, L:h.L, R:h.R, grade:h.grade, wrong:h.wrong||[], at,
+                     tiers: Object.keys(tiers).length ? tiers : undefined, anchor: ct(h.anchor) || undefined,
+                     recheck: rc ? {repeat:rc.c, t:rc.t} : undefined});
         }
       }
       hist.sort((a,b) => a.at - b.at); LS.set(histKey(S.user.sid), hist.slice(-200));
@@ -243,7 +320,7 @@ function pushProgress(setId, data, now){
 function persist(now){
   if(S.view !== 'test' || S.mode !== 'exam' || S.submitted) return;
   const obj = S.entries.filter(e=>e.obj), done = obj.filter(e => S.ans[e.item.id] != null && S.ans[e.item.id] !== '').length;
-  const data = {v:1, ans:S.ans, term:S.term, elapsed:Math.round((Date.now()-S.t0)/1000), tab:S.tab, savedAt:Date.now(), pct: Math.round(done/Math.max(1,obj.length)*100)};
+  const data = {v:1, ans:S.ans, rc:S.rc||[], term:S.term, elapsed:Math.round((Date.now()-S.t0)/1000), tab:S.tab, savedAt:Date.now(), pct: Math.round(done/Math.max(1,obj.length)*100)};
   LS.set(progKey(S.user.sid, S.set.id), data);
   const el = document.getElementById('saved'); if(el) el.textContent = '💾 이 기기에 저장됨';
   pushProgress(S.set.id, data, now);
@@ -252,7 +329,7 @@ async function syncWrong(){
   if(!CFG.SCRIPT_URL || !S.user) return;
   try{
     const r = await apiGet({action:'wrong', sid:S.user.sid});
-    if(r && r.ok && r.wrong){ for(const set of SETS) LS.set(wrongKey(S.user.sid, set.id), r.wrong[set.id] || []); if(S.view==='home') render(); }
+    if(r && r.ok && r.wrong){ for(const set of [...SETS, ...(ANCHOR?[ANCHOR]:[])]) LS.set(wrongKey(S.user.sid, set.id), r.wrong[set.id] || []); if(S.view==='home') render(); }
   }catch(e){}
 }
 async function loadConfig(){
@@ -391,41 +468,58 @@ async function reviewPast(i){
       else { const x = nb[set.id+'|'+it.id]; const hx = x && (x.history||[]).find(y => y.term === h.term && !y.ok); ans[it.id] = hx ? hx.resp : (x ? x.firstResp : ''); }
     }
   }
-  const entries = flatten(set), per = {}, tierPer = {}; let c = 0;
+  // 이 기기에 답안이 있으면 공통·재확인 문항까지 그대로 다시 보여 줌
+  const secs = h.ans ? examSections(set, h.rc || [], !!h.anchor) : set.sections;
+  const entries = flattenSecs(secs), sc = scoreEntries(entries, ans);
+  const cmp = {}, repeatWrongIds = new Set();
+  if(sc.rcRes){ sc.rcRes.repeat.forEach(id => { cmp[id] = 'repeat_wrong'; repeatWrongIds.add(id); }); sc.rcRes.fixed.forEach(id => cmp[id] = 'fixed'); }
+  S = {...S, view:'test', mode:'exam', set, secs, scope:'exam', entries, ids:new Set(entries.map(e => e.item.id)), ans,
+       submitted:true, t0:Date.now(), tab:entries[0].sec.key, retryCount: LS.get(wrongKey(S.user.sid, set.id), []).length,
+       result:{...sc, anchor: sc.anchor || h.anchor || null, dur:h.dur || 0, diag: diagnose(sc.pct, sc.tierPer), past:true, term:h.term, at:h.at,
+               prevAny: i > 0 ? examHist()[i-1] : null, cmp, repeatWrongIds, fixedIds:[], newWrongIds:[]}};
+  render();
+}
+// 채점: 본 문항(진단용) / 공통 문항 / 재확인 문항을 따로 셉니다
+function scoreEntries(entries, ans){
+  const per = {}, tierPer = {}, anchor = {c:0, t:0, wrong:[]}, rcRes = {t:0, repeat:[], fixed:[]}; let c = 0, t = 0;
   for(const e of entries.filter(e => e.obj)){
-    const ok = isCorrect(e, ans[e.item.id]); if(ok) c++;
+    const ok = isCorrect(e, ans[e.item.id]);
+    if(e.extra === 'anchor'){ anchor.t++; if(ok) anchor.c++; else anchor.wrong.push(e.item.id); continue; }
+    if(e.extra === 'recheck'){ rcRes.t++; (ok ? rcRes.fixed : rcRes.repeat).push(e.item.id); continue; }
+    t++; if(ok) c++;
     const k = e.sec.key; per[k] = per[k] || {c:0,t:0}; per[k].t++; if(ok) per[k].c++;
     const tr = e.item.tier || 'elem'; tierPer[tr] = tierPer[tr] || {c:0,t:0}; tierPer[tr].t++; if(ok) tierPer[tr].c++;
   }
-  const t = entries.filter(e => e.obj).length, pct = Math.round(c / Math.max(1, t) * 100);
-  S = {...S, view:'test', mode:'exam', set, scope:'exam', entries, ids:new Set(entries.map(e => e.item.id)), ans,
-       submitted:true, t0:Date.now(), tab:entries[0].sec.key, retryCount: LS.get(wrongKey(S.user.sid, set.id), []).length,
-       result:{c, t, pct, per, tierPer, dur:h.dur || 0, diag: diagnose(pct, tierPer), past:true, term:h.term, at:h.at,
-               cmp:{}, repeatWrongIds:new Set(), fixedIds:[], newWrongIds:[]}};
-  render();
+  return {c, t, pct: Math.round(c / Math.max(1, t) * 100), per, tierPer, anchor: anchor.t ? anchor : null, rcRes: rcRes.t ? rcRes : null};
 }
 function growthCardHTML(regHist){
   const first = regHist[0], last = regHist[regHist.length - 1];
-  const fPct = Math.round(first.c / Math.max(1, first.t) * 100);
-  const lPct = Math.round(last.c / Math.max(1, last.t) * 100);
-  const diff = lPct - fPct;
+  // 비교 기준: 총점이 아니라 난이도별 정답률(평균). 옛 기록처럼 난이도 정보가 없으면 총점으로 대신합니다.
+  const fA = tierAvg(first.tiers), lA = tierAvg(last.tiers);
+  const byTier = fA != null && lA != null;
+  const diff = byTier ? lA - fA : pctOf(last) - pctOf(first);
+  const aDiff = first.anchor && last.anchor && regHist.length >= 2 ? last.anchor.c - first.anchor.c : null;
+  const tierLine = h => h.tiers ? TIER_ORDER.filter(k => h.tiers[k]).map(k => `${TIER_SHORT[k]} <b>${pctOf(h.tiers[k])}%</b>`).join(' · ') : '';
   return `<div class="card" style="margin:14px 0">
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
       <h2 style="margin:0">📈 나의 학기별 성취도 추이</h2>
-      ${regHist.length >= 2 ? `<span class="chip ${diff>=0?'':'seal'}">${diff>=0?'+':''}${diff}%p 변화</span>` : '<span class="chip">첫 진단 완료</span>'}
+      ${regHist.length >= 2 ? `<span class="chip ${diff>=0?'':'seal'}">${byTier?'난이도별 평균 ':''}${signed(diff)}%p</span>
+        ${aDiff != null ? `<span class="chip ${aDiff>=0?'':'seal'}">공통 문항 ${first.anchor.c}→${last.anchor.c}/${last.anchor.t}</span>` : ''}` : '<span class="chip">첫 진단 완료</span>'}
     </div>
     ${regHist.map((h, idx) => {
-      const p = Math.round(h.c / Math.max(1, h.t) * 100);
       const sTitle = getSet(h.set)?.title || h.set;
+      const avg = tierAvg(h.tiers);
       return `<div class="growth-row">
         <span class="chip ${idx===regHist.length-1?'':'warn'}">${esc(h.term||'응시')}</span>
         <div style="flex:1">
-          <b>${esc(sTitle)}</b> · <span class="mono">${h.c}/${h.t} (${p}%)</span>
+          <b>${esc(sTitle)}</b> · <span class="mono">${h.c}/${h.t}</span>${avg != null ? ` · 난이도별 평균 <b class="mono">${avg}%</b>` : ` <span class="mono">(${pctOf(h)}%)</span>`}
+          ${h.tiers ? `<div style="font-size:12.5px">${tierLine(h)}${h.anchor ? ` · 공통 문항 <b>${h.anchor.c}/${h.anchor.t}</b>` : ''}</div>` : ''}
           ${h.grade ? `<div class="muted" style="font-size:12.5px">${esc(h.grade)}</div>` : ''}
         </div>
         <div class="muted" style="font-size:12px">${new Date(h.at).toLocaleDateString('ko-KR')}</div>
       </div>`;
     }).join('')}
+    ${regHist.length >= 2 ? '<div class="muted" style="font-size:12px;margin-top:6px">※ 회차마다 문제가 달라 총점 대신 난이도별 정답률과 공통 문항으로 비교합니다.</div>' : ''}
   </div>`;
 }
 
@@ -433,11 +527,11 @@ function setCard(set, hist){
   const st = setStats(set), wrong = LS.get(wrongKey(S.user.sid, set.id), []);
   const prog = LS.get(progKey(S.user.sid, set.id), null);
   const done = hist.filter(h => h.set === set.id && h.mode !== 'retry');
-  const totalMin = Object.values(set.minutes||{}).reduce((a,b)=>a+b,0) || 60;
+  const totalMin = (Object.values(set.minutes||{}).reduce((a,b)=>a+b,0) || 60) + anchorMinutes();
   const left = prog ? Math.max(0, totalMin*60 - (prog.elapsed||0)) : 0;
   return `<div class="card set">
     <h2>${esc(set.title)} ${prog?'<span class="chip warn">진행 중</span>':''} ${done.length?'<span class="chip">응시 '+done.length+'회</span>':''}</h2>
-    <div class="meta">${Object.entries(st).map(([k,v])=>`${SEC_KO[k]} ${v}문항`).join(' · ')} · 약 ${totalMin}분</div>
+    <div class="meta">${Object.entries(st).map(([k,v])=>`${SEC_KO[k]} ${v}문항`).join(' · ')}${ANCHOR?` + 공통 ${ANCHOR_N}문항`:''}${done.length||examHist().length?' + 재확인 문항':''} · 약 ${totalMin}분</div>
     ${prog ? `<div class="bar" style="margin-bottom:6px"><i style="width:${prog.pct||0}%"></i></div>
       <div class="muted" style="font-size:13px;margin-bottom:10px">${prog.pct||0}% 완료 · 남은 시간 약 ${Math.ceil(left/60)}분</div>
       <button class="btn pri" data-act="exam" data-set="${set.id}" data-v="resume">이어서 풀기</button>
@@ -454,30 +548,33 @@ function startTest(setId, scope, resume){
   if(scope === 'exam'){
     const prog = resume ? LS.get(progKey(S.user.sid, setId), null) : null;
     if(!resume) LS.set(progKey(S.user.sid, setId), null);
-    const entries = flatten(set);
-    S = {...S, view:'test', mode:'exam', set, scope:'exam', entries, ids:new Set(entries.map(e=>e.item.id)), ans: prog?.ans || {},
+    // 두 번째 시험부터: 지난 시험 오답 일부를 재확인 문항으로 추가 (이어서 풀 때는 저장된 목록 그대로)
+    const rc = prog ? (prog.rc || []) : pickRecheck(setId);
+    const secs = examSections(set, rc);
+    const entries = flattenSecs(secs);
+    S = {...S, view:'test', mode:'exam', set, secs, rc, scope:'exam', entries, ids:new Set(entries.map(e=>e.item.id)), ans: prog?.ans || {},
          submitted:false, t0: Date.now() - (prog?.elapsed||0)*1000, tab: prog?.tab || entries[0].sec.key, result:null, retryCount:0,
-         limit: (Object.values(set.minutes||{}).reduce((a,b)=>a+b,0) || 60)*60};
+         limit: ((Object.values(set.minutes||{}).reduce((a,b)=>a+b,0) || 60) + anchorMinutes() + rc.length)*60};
     render(); if(prog) toast('저장된 곳부터 이어서 풉니다.'); else persist(true);
     return;
   }
   const filter = new Set(LS.get(wrongKey(S.user.sid, setId), []));
   const entries = flatten(set).filter(e => scope === 'retry' ? (e.obj && filter.has(e.item.id)) : true);
-  S = {...S, view:'test', mode:'practice', set, scope, entries, ids:new Set(entries.map(e=>e.item.id)), ans:{},
+  S = {...S, view:'test', mode:'practice', set, secs:set.sections, rc:[], scope, entries, ids:new Set(entries.map(e=>e.item.id)), ans:{},
        submitted:false, t0:Date.now(), tab:entries[0]?.sec.key, result:null, retryCount:0};
   render();
 }
 function inScope(item){ return S.ids.has(item.id); }
 
 function viewTest(){
-  const secs = S.set.sections.filter(sec => S.entries.some(e => e.sec === sec));
+  const secs = (S.secs || S.set.sections).filter(sec => S.entries.some(e => e.sec === sec));
   const modeLabel = S.result?.past ? `지난 시험 다시보기 · ${S.result.term||''}` : S.mode==='exam' ? `${S.term} · 진단테스트` : '오답 다시 풀기';
   app.innerHTML = topbar(`<span class="chip">${esc(modeLabel)}</span>${TEACHER?'<span class="chip warn">교수자 모드</span>':''}<span class="mono muted" id="clock">00:00</span>${S.mode==='exam'&&!S.submitted?'<span class="muted" id="saved" style="font-size:12px"></span><button class="btn sm" data-act="saveexit">저장하고 나가기</button>':'<button class="btn sm" data-act="home">나가기</button>'}`) + `
   <div class="wrap">
     <h1>${esc(S.set.title)}</h1>
     ${S.result ? resultHTML() : ''}
     <div class="tabs" role="tablist">${secs.map(sec=>{ const n=S.entries.filter(e=>e.sec===sec).length; return `<button role="tab" data-act="tab" data-v="${sec.key}" aria-selected="${S.tab===sec.key}">${sec.name} ${SEC_KO[sec.key]}<span class="cnt">${n}</span></button>`;}).join('')}</div>
-    ${secs.map(sec => `<section data-sec="${sec.key}" ${S.tab===sec.key?'':'hidden'}>${sec.parts.map(partHTML).join('')}</section>`).join('')}
+    ${secs.map(sec => `<section data-sec="${sec.key}" ${S.tab===sec.key?'':'hidden'}>${sec.intro?`<div class="card now" style="font-size:14px">${sec.intro}</div>`:''}${sec.parts.map(partHTML).join('')}</section>`).join('')}
   </div>
   <div class="foot"><div class="in">
     <div class="prog" id="prog"></div>
@@ -497,7 +594,7 @@ function viewTest(){
 function updateProgress(){
   const p = document.getElementById('prog'); if(!p) return;
   const obj = S.entries.filter(e=>e.obj), done = obj.filter(e => S.ans[e.item.id] != null && S.ans[e.item.id] !== '').length;
-  p.textContent = S.submitted ? `정답 ${S.result.c} / ${S.result.t}` : `응답 완료 ${done} / ${obj.length}문항`;
+  p.textContent = S.submitted ? `${S.mode==='exam'?'진단 문항 ':''}정답 ${S.result.c} / ${S.result.t}` : `응답 완료 ${done} / ${obj.length}문항`;
 }
 
 function partHTML(part){
@@ -519,7 +616,7 @@ function markPassage(text){
 function groupHTML(part, g){
   let head = '';
   if(part.type === 'lgroup'){
-    head = audioTag(S.set.id, g.id);
+    head = audioTag(g._set || S.set.id, g._oid || g.id);
     if(S.submitted || tOK()) head += `<details><summary>녹음 스크립트</summary><div class="script zh">${esc(g.script)}</div></details>`;
   } else if(part.type === 'sentfill'){
     head = `<div class="passage zh">${markPassage(g.passage)}</div><div class="bank zh">${Object.entries(g.bank).map(([k,v])=>`<span><b>${k}</b>${esc(v)}</span>`).join('')}</div>`;
@@ -530,7 +627,7 @@ function groupHTML(part, g){
 }
 function qHTML(part, g, it){
   let top = '';
-  if((part.type === 'tf' || part.type === 'lmc') && it.script) top = audioTag(S.set.id, it.id);
+  if((part.type === 'tf' || part.type === 'lmc') && it.script) top = audioTag(it._set || S.set.id, it._oid || it.id);
   const ent = S.entries.find(e => e.item === it);
   const ok = S.submitted && ent && ent.obj ? isCorrect(ent, S.ans[it.id]) : null;
   const isRepWrong = S.submitted && ok === false && S.result?.repeatWrongIds?.has(it.id);
@@ -544,7 +641,7 @@ function optBtn(id, val, label, txt){
   return `<button class="opt ${cls}" data-act="pick" data-id="${id}" data-v="${esc(val)}"><b>${esc(label)}</b>${txt!=null?`<span class="zh">${esc(txt)}</span>`:''}</button>`;
 }
 function qBody(part, g, it){
-  const t = part.type, id = it.id, n = itemNo(id);
+  const t = part.type, id = it.id, n = it._label || itemNo(id);
   const entry = S.entries.find(e => e.item === it);
   let h = '';
   const tierBadge = (S.submitted || tOK()) && it.tier ? `<span class="chip" style="font-size:11px;margin-right:6px">${esc(TIER_KO[it.tier]||it.tier)}</span>` : '';
@@ -628,17 +725,17 @@ function diagnose(pct, tierStats){
   const d = tiers.find(ok) || tiers[tiers.length - 1] || {grade:'진단 완료', color:'jade', summary:'', guide:''};
   return d;
 }
-function recordNotebook(setId, rows){
+function recordNotebook(rows){
   const nb = LS.get(nbKey(S.user.sid), {});
   for(const r of rows){
     if(r.ok == null) continue;
-    const k = setId+'|'+r.id;
-    const it = nb[k] = nb[k] || {set:setId, id:r.id, tries:0, misses:0, firstResp:'', lastResp:'', lastOk:false, lastAt:'', history:[]};
+    const k = r.set+'|'+r.id;
+    const it = nb[k] = nb[k] || {set:r.set, id:r.id, tries:0, misses:0, firstResp:'', lastResp:'', lastOk:false, lastAt:'', history:[]};
     it.tries++;
     if(!r.ok){ it.misses++; if(!it.firstResp) it.firstResp = String(r.resp); }
     it.lastResp = String(r.resp); it.lastOk = !!r.ok; it.lastAt = new Date().toISOString();
     it.history = it.history || [];
-    it.history.push({term: S.term, mode: S.mode, resp: String(r.resp), ok: !!r.ok, at: new Date().toLocaleDateString('ko-KR')});
+    it.history.push({term: S.term, mode: r.mode, resp: String(r.resp), ok: !!r.ok, at: new Date().toLocaleDateString('ko-KR')});
   }
   LS.set(nbKey(S.user.sid), nb);
 }
@@ -647,46 +744,58 @@ async function submit(){
   const obj = S.entries.filter(e => e.obj);
   const blank = obj.filter(e => S.ans[e.item.id] == null || S.ans[e.item.id] === '').length;
   if(blank && !confirm(`아직 답하지 않은 문항이 ${blank}개 있습니다. 제출할까요?`)) return;
-  const per = {}, tierPer = {}; let c = 0;
-  const rows = [];
-  for(const e of obj){
-    const ok = isCorrect(e, S.ans[e.item.id]); if(ok) c++;
-    const k = e.sec.key; per[k] = per[k] || {c:0,t:0}; per[k].t++; if(ok) per[k].c++;
-    const tr = e.item.tier || 'elem'; tierPer[tr] = tierPer[tr] || {c:0,t:0}; tierPer[tr].t++; if(ok) tierPer[tr].c++;
-    rows.push({id:e.item.id, sec:k, part:e.part.type, resp:S.ans[e.item.id] ?? '', key: Array.isArray(e.item.ans)?e.item.ans[0]:e.item.ans, ok});
-  }
+  const sc = scoreEntries(S.entries, S.ans);
+  const {c, pct, per, tierPer} = sc;
+  const baseMode = S.mode === 'exam' ? 'exam' : 'retry';
+  // 응답 행: 재확인 문항은 원래 세트·문항 번호로, 공통 문항은 anchor 세트로 기록
+  const rows = obj.map(e => {
+    const o = originOf(e), ok = isCorrect(e, S.ans[e.item.id]);
+    return {id:o.id, set:o.set, mode: e.extra === 'recheck' ? 'recheck' : baseMode, sec:e.sec.key, part:e.part.type,
+            resp:S.ans[e.item.id] ?? '', key: Array.isArray(e.item.ans)?e.item.ans[0]:e.item.ans, ok, extra:e.extra, uid:e.item.id};
+  });
   const dur = (Date.now() - S.t0)/1000;
-  const pct = Math.round(c / Math.max(1, obj.length) * 100);
   const diag = S.mode === 'exam' ? diagnose(pct, tierPer) : null;
 
-  // 이전 동일 세트 응시 기록과 비교 (반복 오답 / 극복 오답 판별)
   const hist = LS.get(histKey(S.user.sid), []);
   const prevSame = [...hist].reverse().find(h => h.set === S.set.id && h.mode !== 'retry');
   const prevAny = S.mode === 'exam' ? [...hist].reverse().find(h => h.mode !== 'retry') : null;
   const cmp = {}, repeatWrongIds = new Set(), fixedIds = [], newWrongIds = [];
+  // ① 같은 세트를 다시 푼 경우(오답 다시 풀기, 또는 8회를 다 돌고 같은 회차): 문항별로 지난번과 비교
   if(prevSame && Array.isArray(prevSame.wrong)){
     const prevW = new Set(prevSame.wrong);
-    for(const r of rows){
-      if(prevW.has(r.id) && !r.ok){ cmp[r.id] = 'repeat_wrong'; repeatWrongIds.add(r.id); }
-      else if(prevW.has(r.id) && r.ok){ cmp[r.id] = 'fixed'; fixedIds.push(r.id); }
-      else if(!prevW.has(r.id) && !r.ok){ cmp[r.id] = 'new_wrong'; newWrongIds.push(r.id); }
+    for(const r of rows.filter(r => !r.extra)){
+      if(prevW.has(r.id) && !r.ok){ cmp[r.uid] = 'repeat_wrong'; repeatWrongIds.add(r.uid); }
+      else if(prevW.has(r.id) && r.ok){ cmp[r.uid] = 'fixed'; fixedIds.push(r.uid); }
+      else if(!prevW.has(r.id) && !r.ok && S.mode === 'exam'){ cmp[r.uid] = 'new_wrong'; newWrongIds.push(r.uid); }
     }
+  }
+  // ② 재확인 문항: 지난 시험(다른 회차)에서 틀렸던 문항을 이번에 또 틀렸는지
+  if(sc.rcRes){
+    sc.rcRes.repeat.forEach(id => { cmp[id] = 'repeat_wrong'; repeatWrongIds.add(id); });
+    sc.rcRes.fixed.forEach(id => { cmp[id] = 'fixed'; });
   }
 
   S.submitted = true; S.homeTab = null;
-  S.result = {c, t:obj.length, pct, per, tierPer, dur, diag, prevSame, prevAny, cmp, repeatWrongIds, fixedIds, newWrongIds};
+  S.result = {...sc, dur, diag, prevSame, prevAny, cmp, repeatWrongIds, fixedIds, newWrongIds};
   S.tab = S.entries[0]?.sec.key;
 
-  const wk = wrongKey(S.user.sid, S.set.id); const wrong = new Set(LS.get(wk, []));
-  for(const r of rows) if(r.ok === true) wrong.delete(r.id); else if(r.ok === false) wrong.add(r.id);
-  LS.set(wk, [...wrong]); S.retryCount = wrong.size;
-  recordNotebook(S.set.id, rows);
+  // 세트별 오답 목록 갱신 (재확인 문항은 원래 세트, 공통 문항은 anchor)
+  const touched = {};
+  for(const r of rows){ if(r.ok == null) continue; const w = touched[r.set] = touched[r.set] || new Set(LS.get(wrongKey(S.user.sid, r.set), [])); if(r.ok) w.delete(r.id); else w.add(r.id); }
+  for(const sid in touched) LS.set(wrongKey(S.user.sid, sid), [...touched[sid]]);
+  S.retryCount = (touched[S.set.id] || new Set(LS.get(wrongKey(S.user.sid, S.set.id), []))).size;
+  recordNotebook(rows);
 
-  const wrongArr = rows.filter(r => !r.ok).map(r => r.id);
+  const wrongArr = rows.filter(r => !r.extra && !r.ok).map(r => r.id);
+  const tiers = Object.fromEntries(Object.entries(tierPer).map(([k,v]) => [k, {c:v.c, t:v.t}]));
   hist.push({
-    set:S.set.id, term:S.term, mode:S.mode==='exam'?'exam':'retry', c, t:obj.length,
+    set:S.set.id, term:S.term, mode:baseMode, c, t:sc.t,
     L: per.L?`${per.L.c}/${per.L.t}`:'', R: per.R?`${per.R.c}/${per.R.t}`:'',
     grade: diag ? diag.grade : '', wrong: wrongArr, at:Date.now(), dur:Math.round(dur),
+    tiers: S.mode === 'exam' ? tiers : undefined,
+    anchor: sc.anchor ? {c:sc.anchor.c, t:sc.anchor.t} : undefined,
+    rc: S.mode === 'exam' ? (S.rc || []) : undefined,
+    recheck: sc.rcRes ? {repeat:sc.rcRes.repeat.length, fixed:sc.rcRes.fixed.length, t:sc.rcRes.t} : undefined,
     ans: S.mode === 'exam' ? Object.fromEntries(Object.entries(S.ans).filter(([k]) => !k.startsWith('_'))) : undefined
   });
   LS.set(histKey(S.user.sid), hist.slice(-200));
@@ -700,8 +809,11 @@ async function submit(){
     try{
       const r = await api({
         action:'submit', sid:S.user.sid, name:S.user.name, setId:S.set.id, term:S.term,
-        mode:S.mode==='exam'?'exam':'retry', score:c, total:obj.length, per,
-        grade: diag ? diag.grade : '', durationSec:Math.round(dur), answers:rows
+        mode:baseMode, score:c, total:sc.t, per, tiers: S.mode === 'exam' ? tiers : null,
+        anchor: sc.anchor ? {c:sc.anchor.c, t:sc.anchor.t} : null,
+        recheck: sc.rcRes ? {repeat:sc.rcRes.repeat.length, t:sc.rcRes.t} : null,
+        grade: diag ? diag.grade : '', durationSec:Math.round(dur),
+        answers: rows.map(({id, set, mode, sec, part, resp, key, ok}) => ({id, set, mode, sec, part, resp, key, ok}))
       });
       toast(r && r.ok ? '✅ 진단 결과가 구글시트에 저장되었습니다.' : '⚠️ 시트 저장 실패 — 결과는 이 기기에 저장됐습니다.');
     }catch(err){ toast('⚠️ 네트워크 오류 — 결과는 이 기기에 저장됐습니다.'); }
@@ -717,48 +829,76 @@ function courseHTML(d){
   return `<div style="margin-top:10px"><b style="font-size:14px">🎓 추천 과목</b><div style="margin-top:4px;display:flex;flex-wrap:wrap">${chips(list)}</div>
     ${next.length ? `<div style="margin-top:8px"><b style="font-size:13px">⬆️ 다음 단계로 도전해 볼 과목</b><div style="margin-top:4px;display:flex;flex-wrap:wrap">${next.map(c=>`<span class="chip warn" style="margin:3px 4px 0 0;font-size:13px;padding:4px 10px">${esc(c)}</span>`).join('')}</div></div>` : ''}</div>`;
 }
+// 지난 시험과 난이도별 정답률 비교표 (회차마다 문항이 달라 총점 대신 이것으로 비교)
+function tierCompareHTML(prev, cur){
+  const rows = TIER_ORDER.filter(k => cur[k]).map(k => {
+    const a = prev && prev[k] ? pctOf(prev[k]) : null, b = pctOf(cur[k]);
+    const d = a == null ? null : b - a;
+    return `<tr><td>${TIER_KO[k]}</td><td class="mono">${a == null ? '-' : a + '%'}</td><td class="mono"><b>${b}%</b></td>
+      <td>${d == null ? '-' : `<span class="chip ${d>=0?'':'seal'}">${signed(d)}%p</span>`}</td></tr>`;
+  }).join('');
+  const pa = tierAvg(prev), ca = tierAvg(cur);
+  return `<table class="dash" style="margin-top:8px"><tr><th>난이도</th><th>지난 시험</th><th>이번 시험</th><th>변화</th></tr>${rows}
+    <tr><td><b>난이도별 평균</b></td><td class="mono">${pa == null ? '-' : pa + '%'}</td><td class="mono"><b>${ca}%</b></td>
+    <td>${pa == null ? '-' : `<span class="chip ${ca-pa>=0?'':'seal'}">${signed(ca-pa)}%p</span>`}</td></tr></table>`;
+}
 function resultHTML(){
   const r = S.result;
   const secCards = Object.entries(r.per).map(([k,v]) => {
     const p = Math.round(v.c/v.t*100);
     return `<div class="card"><div class="muted">${SEC_KO[k]} 영역</div><div class="mono" style="font-size:22px;font-weight:600">${v.c}/${v.t}</div><div class="bar"><i style="width:${p}%"></i></div><div class="muted" style="font-size:12px;margin-top:4px">${p}% 달성</div></div>`;
   }).join('');
-  const tierCards = Object.entries(r.tierPer).map(([k,v]) => {
-    const p = Math.round(v.c/v.t*100);
+  const tierCards = TIER_ORDER.filter(k => r.tierPer[k]).map(k => {
+    const v = r.tierPer[k], p = Math.round(v.c/v.t*100);
     return `<div class="card"><div class="muted">${TIER_KO[k]||k}</div><div class="mono" style="font-size:18px;font-weight:600">${v.c}/${v.t} (${p}%)</div><div class="bar"><i style="width:${p}%"></i></div></div>`;
   }).join('');
 
   let cmpBox = '';
-  if(r.past){
-    cmpBox = `<div class="muted" style="margin-top:8px;font-size:13px">📄 ${new Date(r.at).toLocaleDateString('ko-KR')}에 본 시험의 결과입니다.</div>`;
-  } else if(!r.prevSame && r.prevAny){
-    const prevPct = Math.round(r.prevAny.c / Math.max(1, r.prevAny.t) * 100), diff = r.pct - prevPct;
+  if(S.mode !== 'exam'){
+    // 오답 다시 풀기: 지난 시험 점수와 %p로 비교하지 않음(문항 수가 달라 의미가 없음). 극복·반복 오답만 보여 줌.
     cmpBox = `<div class="card" style="margin-top:12px;background:var(--paper)">
-      <b>🔄 지난 시험([${esc(r.prevAny.term||'이전')}] ${esc(getSet(r.prevAny.set)?.title||'')} · ${prevPct}%)과 비교</b>
+      <b>🔁 오답 다시 풀기 결과 — 지난번에 틀린 ${r.t}문항</b>
       <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
-        <span class="chip ${diff>=0?'':'seal'}">점수 변화: ${diff>=0?'+':''}${diff}%p</span>
-        ${r.prevAny.grade ? `<span class="chip warn">지난 진단: ${esc(r.prevAny.grade)}</span>` : ''}
-      </div></div>`;
-  } else if(r.prevSame){
-    const prevPct = Math.round(r.prevSame.c / Math.max(1, r.prevSame.t) * 100);
-    const diff = r.pct - prevPct;
-    cmpBox = `<div class="card" style="margin-top:12px;background:var(--paper)">
-      <b>🔄 이전 응시([${esc(r.prevSame.term||'이전')}] ${prevPct}%)와의 비교 결과</b>
-      <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
-        <span class="chip ${diff>=0?'':'seal'}">점수 변화: ${diff>=0?'+':''}${diff}%p</span>
-        <span class="chip seal">🔴 또 틀린 문제 (반복 오답): ${r.repeatWrongIds.size}개</span>
         <span class="chip">🟢 극복한 문제 (오답→정답): ${r.fixedIds.length}개</span>
-        <span class="chip warn">🟡 새로 틀린 문제: ${r.newWrongIds.length}개</span>
+        <span class="chip seal">🔴 또 틀린 문제 (반복 오답): ${r.repeatWrongIds.size}개</span>
       </div>
-      ${r.repeatWrongIds.size ? `<div class="muted" style="font-size:13px;margin-top:6px">※ 지난번에도 틀리고 이번에 또 틀린 문항(${[...r.repeatWrongIds].join(', ')})은 아래에서 붉은 테두리로 강조되어 있습니다.</div>` : ''}
+      ${r.repeatWrongIds.size ? `<div class="muted" style="font-size:13px;margin-top:6px">※ 또 틀린 문항은 아래에서 붉은 테두리로 강조되어 있습니다.</div>` : ''}
     </div>`;
+  } else {
+    const p = r.prevAny;
+    if(r.past) cmpBox += `<div class="muted" style="margin-top:8px;font-size:13px">📄 ${new Date(r.at).toLocaleDateString('ko-KR')}에 본 시험의 결과입니다.</div>`;
+    if(p){
+      const grade = p.grade && r.diag ? (p.grade === r.diag.grade ? '진단 등급 유지' : `진단 등급: ${esc(p.grade.split(' · ')[0])} → ${esc(r.diag.grade.split(' · ')[0])}`) : '';
+      cmpBox += `<div class="card" style="margin-top:12px;background:var(--paper)">
+        <b>🔄 지난 시험([${esc(p.term||'이전')}] ${esc(getSet(p.set)?.title||'')})과 난이도별 비교</b>
+        <div class="muted" style="font-size:13px;margin-top:2px">회차마다 문제가 달라 총점 대신 난이도별 정답률로 비교합니다.</div>
+        ${p.tiers ? tierCompareHTML(p.tiers, r.tierPer) : `<div style="margin-top:6px"><span class="chip">지난 시험 ${pctOf(p)}% → 이번 ${r.pct}% (난이도별 기록 없음)</span></div>`}
+        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+          ${grade ? `<span class="chip warn">${grade}</span>` : ''}
+          ${p.anchor && r.anchor ? `<span class="chip ${r.anchor.c>=p.anchor.c?'':'seal'}">📌 공통 문항(같은 문제): ${p.anchor.c}/${p.anchor.t} → ${r.anchor.c}/${r.anchor.t}</span>` : ''}
+        </div></div>`;
+    }
+    if(r.anchor && !(p && p.anchor)) cmpBox += `<div class="card" style="margin-top:12px;background:var(--paper)"><b>📌 공통 문항 ${r.anchor.c}/${r.anchor.t}</b>
+      <div class="muted" style="font-size:13px;margin-top:4px">모든 회차에 똑같이 나오는 문제입니다. 다음 시험에서 같은 문제로 성취도를 비교합니다.</div></div>`;
+    if(r.rcRes) cmpBox += `<div class="card" style="margin-top:12px;background:var(--paper)">
+      <b>🔁 재확인 문항 — 지난 시험에서 틀렸던 ${r.rcRes.t}문항</b>
+      <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
+        <span class="chip seal">🔴 또 틀린 문제: ${r.rcRes.repeat.length}개</span>
+        <span class="chip">🟢 이번엔 맞힌 문제: ${r.rcRes.fixed.length}개</span>
+      </div>
+      <div class="muted" style="font-size:13px;margin-top:6px">※ ‘재확인 문항’ 탭에서 문항별로 확인하세요. 또 틀린 문항은 붉은 테두리로 강조되고 오답노트의 반복 오답에 쌓입니다.</div></div>`;
+    else if(r.prevSame && r.repeatWrongIds.size + r.fixedIds.length) cmpBox += `<div class="card" style="margin-top:12px;background:var(--paper)">
+      <b>🔁 같은 회차 이전 응시와 문항별 비교</b>
+      <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
+        <span class="chip seal">🔴 또 틀린 문제: ${r.repeatWrongIds.size}개</span><span class="chip">🟢 극복한 문제: ${r.fixedIds.length}개</span><span class="chip warn">🟡 새로 틀린 문제: ${r.newWrongIds.length}개</span>
+      </div></div>`;
   }
 
   return `<div class="card" style="margin:12px 0">
     <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
       <div class="score-big">${r.pct}<span style="font-size:20px">%</span></div>
       <div>
-        <b>${r.c} / ${r.t} 정답</b> · 소요 ${fmtTime(r.dur)} · <span class="chip">${esc(r.term || S.term)}</span><br>
+        <b>${r.c} / ${r.t} 정답</b>${S.mode==='exam'?' <span class="muted" style="font-size:13px">(진단 문항)</span>':''} · 소요 ${fmtTime(r.dur)} · <span class="chip">${esc(r.term || S.term)}</span><br>
         <span class="muted" style="font-size:13px">아래에서 문항별 정답·해설 및 AI 심층 해설을 확인하세요.</span>
       </div>
     </div>
@@ -892,20 +1032,28 @@ async function loadTeacher(){
       if(!r || !r.ok){ sessionStorage.removeItem('cufs_pin_ok'); out.innerHTML = `<p class="chip seal">${esc(r?.error || '조회 실패')}</p>`; return; }
       sessionStorage.setItem('cufs_pin_ok', '1');
       out.innerHTML = `<h2>학생별 학기 성취도 변화 (${r.students.length}명)</h2>
-        <table class="dash"><tr><th>학번</th><th>이름</th><th>응시횟수</th><th>첫 진단 (입학)</th><th>최근 진단 (학기말)</th><th>성취도 변화</th><th>반복 오답</th></tr>
+        <p class="muted" style="font-size:13px;margin-top:0">회차마다 문제가 달라 <b>난이도별 정답률(평균)</b>과 <b>공통 문항(모든 회차에 같은 문제)</b>으로 비교합니다. 반복 오답은 학기말 시험의 재확인 문항 중 또 틀린 수입니다.</p>
+        <table class="dash"><tr><th>학번</th><th style="white-space:nowrap">이름</th><th style="white-space:nowrap">응시</th><th>첫 진단</th><th>최근 진단</th><th>난이도별 변화</th><th style="white-space:nowrap">공통 문항</th><th style="white-space:nowrap">반복 오답</th></tr>
         ${r.students.map(st => {
-          const diffStr = st.diff == null ? '-' : `<span class="chip ${st.diff>=0?'':'seal'}">${st.diff>=0?'+':''}${st.diff}%p</span>`;
+          const two = st.count >= 2;
+          const lvl = rec => rec.avg != null ? `난이도 평균 <b>${rec.avg}%</b>` : `<b>${rec.pct}%</b>`;
+          const diff = st.avgDiff != null ? st.avgDiff : st.diff;
+          const diffStr = !two || diff == null ? '-' : `<span class="chip ${diff>=0?'':'seal'}">${signed(diff)}%p</span>`;
+          const td = st.tierDiff ? `<div class="muted" style="font-size:12px;margin-top:2px">${TIER_ORDER.filter(k => st.tierDiff[k] != null).map(k => `${TIER_SHORT[k]} ${signed(st.tierDiff[k])}`).join(' · ')}</div>` : '';
+          const anc = two && st.first.anchor && st.last.anchor ? `<span class="mono">${st.first.anchor.c}→${st.last.anchor.c}/${st.last.anchor.t}</span>` : (st.first.anchor ? `<span class="mono">${st.first.anchor.c}/${st.first.anchor.t}</span>` : '-');
+          const rw = two && st.last.recheck ? `<span class="mono">${st.last.recheck.repeat}/${st.last.recheck.t}</span>` : (two && st.repeatWrong ? st.repeatWrong + '개' : '-');
           return `<tr>
-            <td class="mono">${esc(st.sid)}</td><td><b>${esc(st.name)}</b></td><td class="mono">${st.count}회</td>
-            <td>[${esc(st.first.term)}] <b>${st.first.pct}%</b><br><span class="muted" style="font-size:12px">${esc(st.first.grade)}</span></td>
-            <td>${st.count>=2?`[${esc(st.last.term)}] <b>${st.last.pct}%</b><br><span class="muted" style="font-size:12px">${esc(st.last.grade)}</span>`:'-'}</td>
-            <td>${diffStr}</td>
-            <td class="mono">${st.count>=2 ? st.repeatWrong+'개' : '-'}</td>
+            <td class="mono">${esc(st.sid)}</td><td style="white-space:nowrap"><b>${esc(st.name)}</b></td><td class="mono" style="white-space:nowrap">${st.count}회</td>
+            <td>[${esc(st.first.term)}] ${lvl(st.first)}<br><span class="muted" style="font-size:12px">${esc(st.first.grade)}</span></td>
+            <td>${two?`[${esc(st.last.term)}] ${lvl(st.last)}<br><span class="muted" style="font-size:12px">${esc(st.last.grade)}</span>`:'-'}</td>
+            <td>${diffStr}${two ? td : ''}</td>
+            <td>${anc}</td>
+            <td>${rw}</td>
           </tr>`;
-        }).join('') || '<tr><td colspan="7" class="muted">기록 없음</td></tr>'}</table>`;
+        }).join('') || '<tr><td colspan="8" class="muted">기록 없음</td></tr>'}</table>`;
     }catch(e){ out.innerHTML = '<p class="chip seal">네트워크 오류</p>'; }
   } else {
-    out.innerHTML = `<div style="margin-bottom:10px"><select id="tset">${SETS.map(s=>`<option value="${s.id}">${esc(s.title)}</option>`).join('')}</select></div><div id="tsetout"></div>`;
+    out.innerHTML = `<div style="margin-bottom:10px"><select id="tset">${[...SETS, ...(ANCHOR?[ANCHOR]:[])].map(s=>`<option value="${s.id}">${esc(s.title)}${s===ANCHOR?' (모든 회차 공통)':''}</option>`).join('')}</select></div><div id="tsetout"></div>`;
     const loadSetStat = async () => {
       const set = document.getElementById('tset').value, box = document.getElementById('tsetout');
       box.innerHTML = '<p class="muted">불러오는 중…</p>';
